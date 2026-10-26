@@ -3,6 +3,8 @@
 namespace App\Hashing;
 
 use Illuminate\Contracts\Hashing\Hasher;
+use Illuminate\Support\Facades\DB;
+use Symfony\Component\Process\Process;
 
 class BetterAuthHasher implements Hasher
 {
@@ -15,7 +17,7 @@ class BetterAuthHasher implements Hasher
     }
 
     /**
-     * Hash the given value.
+     * Hash the given value using standard Bcrypt.
      */
     public function make($value, array $options = [])
     {
@@ -26,7 +28,7 @@ class BetterAuthHasher implements Hasher
     /**
      * Check the given plain value against a hash.
      * Mendukung:
-     * 1. Bcrypt ($2y$, $2a$)
+     * 1. Bcrypt standar ($2y$, $2a$, $2b$)
      * 2. Better-Auth scrypt (<salt_hex>:<key_hex>)
      * 3. Plaintext fallback
      */
@@ -36,8 +38,8 @@ class BetterAuthHasher implements Hasher
             return false;
         }
 
-        // 1. Jika hash berupa Bcrypt standar ($2y$ atau $2a$)
-        if (str_starts_with($hashedValue, '$2y$') || str_starts_with($hashedValue, '$2a$')) {
+        // 1. Jika hash berupa Bcrypt standar ($2y$, $2a$, atau $2b$)
+        if (str_starts_with($hashedValue, '$2y$') || str_starts_with($hashedValue, '$2a$') || str_starts_with($hashedValue, '$2b$')) {
             return password_verify($value, $hashedValue);
         }
 
@@ -47,15 +49,10 @@ class BetterAuthHasher implements Hasher
             if (count($parts) === 2) {
                 [$salt, $expectedKey] = $parts;
                 
-                // Gunakan node.js scrypt bawaan untuk verifikasi secepat kilat (~80ms)
-                $cmd = sprintf(
-                    'node -e "const crypto=require(\'crypto\');crypto.scrypt(process.argv[1],process.argv[2],64,{N:16384,r:16,p:1,maxmem:67108864},(e,k)=>{if(e)process.exit(1);process.stdout.write(k.toString(\'hex\'));});" %s %s',
-                    escapeshellarg($value),
-                    escapeshellarg($salt)
-                );
-
-                $calculatedKey = @shell_exec($cmd);
+                $calculatedKey = $this->calculateScryptKey($value, $salt);
                 if ($calculatedKey && hash_equals(trim($expectedKey), trim($calculatedKey))) {
+                    // Otomatis upgrade ke Bcrypt di database agar login berikutnya instan (native PHP)
+                    $this->upgradeToBcrypt($hashedValue, $value);
                     return true;
                 }
             }
@@ -63,10 +60,101 @@ class BetterAuthHasher implements Hasher
 
         // 3. Fallback: kecocokan plaintext (untuk user lama sebelum migrasi hash)
         if ($hashedValue === $value) {
+            $this->upgradeToBcrypt($hashedValue, $value);
             return true;
         }
 
         return false;
+    }
+
+    /**
+     * Menghitung scrypt key menggunakan runtime yang aman (Symfony Process / CLI)
+     */
+    protected function calculateScryptKey(string $password, string $salt): ?string
+    {
+        $script = 'const crypto=require("crypto");crypto.scrypt(process.argv[1],process.argv[2],64,{N:16384,r:16,p:1,maxmem:67108864},(e,k)=>{if(e)process.exit(1);process.stdout.write(k.toString("hex"));});';
+
+        // Metode 1: Menggunakan Symfony Process (cara standar Laravel)
+        try {
+            if (class_exists(Process::class)) {
+                $process = new Process(['node', '-e', $script, $password, $salt]);
+                $process->setTimeout(4);
+                $process->run();
+                if ($process->isSuccessful()) {
+                    $out = trim($process->getOutput());
+                    if (!empty($out)) return $out;
+                }
+            }
+        } catch (\Throwable $e) {}
+
+        // Metode 2: proc_open jika tersedia
+        if (function_exists('proc_open')) {
+            try {
+                $cmd = sprintf(
+                    'node -e "%s" %s %s',
+                    addcslashes($script, '"\\'),
+                    escapeshellarg($password),
+                    escapeshellarg($salt)
+                );
+                $descriptors = [
+                    1 => ['pipe', 'w'],
+                    2 => ['pipe', 'w'],
+                ];
+                $proc = @proc_open($cmd, $descriptors, $pipes);
+                if (is_resource($proc)) {
+                    $output = stream_get_contents($pipes[1]);
+                    fclose($pipes[1]);
+                    fclose($pipes[2]);
+                    proc_close($proc);
+                    if (!empty(trim($output))) return trim($output);
+                }
+            } catch (\Throwable $e) {}
+        }
+
+        // Metode 3: exec jika tersedia
+        if (function_exists('exec')) {
+            try {
+                $cmd = sprintf(
+                    'node -e "%s" %s %s',
+                    addcslashes($script, '"\\'),
+                    escapeshellarg($password),
+                    escapeshellarg($salt)
+                );
+                $output = [];
+                @exec($cmd, $output);
+                $joined = trim(implode('', $output));
+                if (!empty($joined)) return $joined;
+            } catch (\Throwable $e) {}
+        }
+
+        // Metode 4: shell_exec HANYA jika fungsi tersebut benar-benar ada
+        if (function_exists('shell_exec')) {
+            try {
+                $cmd = sprintf(
+                    'node -e "%s" %s %s',
+                    addcslashes($script, '"\\'),
+                    escapeshellarg($password),
+                    escapeshellarg($salt)
+                );
+                $out = @shell_exec($cmd);
+                if (!empty(trim($out))) return trim($out);
+            } catch (\Throwable $e) {}
+        }
+
+        return null;
+    }
+
+    /**
+     * Memperbarui hash lama di database menjadi Bcrypt standar
+     */
+    protected function upgradeToBcrypt(string $oldHash, string $plainPassword): void
+    {
+        try {
+            $newBcrypt = password_hash($plainPassword, PASSWORD_BCRYPT);
+            DB::table('account')
+                ->where('password', $oldHash)
+                ->update(['password' => $newBcrypt]);
+        } catch (\Throwable $e) {}
     }
 
     /**

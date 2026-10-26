@@ -2,6 +2,8 @@
 
 namespace App\Providers;
 
+use App\Hashing\BetterAuthHasher;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -19,6 +21,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        //
+        Hash::extend('better-auth', function () {
+            return new BetterAuthHasher();
+        });
     }
 }
